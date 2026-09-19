@@ -12,26 +12,129 @@ Pipeline Steps:
 Dependencies: pip install numpy trimesh shapely scikit-learn mapbox-earcut
 
 Reference:
-  Choi, J., Hong, T. (2026). Automated Geometry Pre-processing Pipeline
-  for Urban-scale CFD Simulation. [Journal TBD].
+  Choi, J., Hong, T., Kim, H., and Jeong, K. (2026). Discretization-based
+  Reconstruction of Watertight Building Geometry from Raw GIS Data for
+  Urban CFD Simulation. Developments in the Built Environment
+  (DIBE-D-26-01168R1).
 """
 
 import numpy as np, trimesh, shapely, argparse, time, os, sys, logging
-from shapely.geometry import MultiPoint
+from collections import defaultdict
+from shapely.geometry import MultiPoint, Polygon
 from sklearn.cluster import DBSCAN
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
-    "sampling_density": 10.0, "max_pts_per_building": 2000, "min_pts_per_building": 100,
+    "sampling_density": 10.0, 
+    "max_pts_per_building": 2000, 
+    "min_pts_per_building": 100,
     "eps": 2.5, "min_pts": 30,
     "alpha_ratio": 0.2, "allow_holes": False,
-    "simplify_tolerance": 0.6,
-    "height_percentile_low": 5, "height_percentile_high": 99,
+    "simplify_tolerance": 0.5,
+    "height_percentile_low": 5, 
+    "height_percentile_high": 99,
     "min_building_height": 2.0,
     "min_footprint_area": 8.0,
+    "random_seed": 0,
+    # --- geometry-consistency safeguards (v1.1) ---
+    # Both thresholds are set above the coordinate resolution of a
+    # single-precision (float32) STL at UTM-scale coordinates (~6 cm at 5e5 m),
+    # so that vertices can never collapse onto each other on export.
+    "min_edge_length": 0.15,
+    "coincident_inset": 0.15,
 }
+
+def _clean_polygon(poly, min_edge):
+    """Regularize a footprint ring: remove edges shorter than min_edge and
+    vertices whose deviation from the line joining their neighbors is below
+    min_edge. Both conditions can collapse into degenerate faces after
+    single-precision (STL) export. Returns None if the ring collapses."""
+    def clean_ring(ring):
+        pts = list(ring.coords)[:-1]
+        out = []
+        for p in pts:
+            if out and (p[0]-out[-1][0])**2 + (p[1]-out[-1][1])**2 < min_edge**2:
+                continue
+            out.append(p)
+        while len(out) > 1 and (out[0][0]-out[-1][0])**2 + (out[0][1]-out[-1][1])**2 < min_edge**2:
+            out.pop()
+        if len(out) < 3:
+            return None
+        changed = True
+        while changed and len(out) > 3:
+            changed = False
+            for i in range(len(out)):
+                a, b, c = out[i-1], out[i], out[(i+1) % len(out)]
+                ac = ((c[0]-a[0])**2 + (c[1]-a[1])**2) ** 0.5
+                if ac < 1e-12:
+                    continue
+                cross = abs((b[0]-a[0])*(c[1]-b[1]) - (b[1]-a[1])*(c[0]-b[0]))
+                if cross / ac < min_edge:
+                    out.pop(i); changed = True; break
+        return out if len(out) >= 3 else None
+    ring = clean_ring(poly.exterior)
+    if ring is None:
+        return None
+    cleaned = Polygon(ring)
+    return cleaned if cleaned.is_valid and cleaned.area > 0 else None
+
+def _verify_mesh_integrity(mesh):
+    """Mesh-level QC at single-precision (float32) resolution: counts
+    non-manifold edges and degenerate faces exactly as they will appear in
+    the written STL file."""
+    v = np.asarray(mesh.vertices, dtype=np.float32).astype(np.float64)
+    m = trimesh.Trimesh(vertices=v, faces=np.asarray(mesh.faces), process=False)
+    m.merge_vertices()
+    e2f = defaultdict(int)
+    for f in m.faces:
+        for a, b in ((f[0], f[1]), (f[1], f[2]), (f[2], f[0])):
+            e2f[tuple(sorted((int(a), int(b))))] += 1
+    nm = sum(1 for c in e2f.values() if c > 2)
+    deg = int(np.sum(m.area_faces <= 1e-10))
+    return nm, deg
+
+def _fix_sliver(fp, mesh, min_edge):
+    """Perturb the footprint vertex responsible for a cap face that would be
+    degenerate after single-precision (float32) export: such faces arise when
+    a ring vertex lies (almost exactly) on the segment between two other ring
+    vertices. The vertex is moved perpendicular to that segment by min_edge,
+    on the side that keeps the polygon valid. Returns the fixed polygon or
+    None if no safe fix exists."""
+    v = np.asarray(mesh.vertices, dtype=np.float32).astype(np.float64)
+    f = np.asarray(mesh.faces)
+    tri = v[f]
+    areas = 0.5 * np.linalg.norm(
+        np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+    bad = np.where(areas <= 1e-10)[0]
+    if len(bad) == 0:
+        return None
+    p = tri[bad[0]]
+    # sliver vertex = the one closest to the line through the other two
+    best = None
+    for i in range(3):
+        a, b = p[(i + 1) % 3], p[(i + 2) % 3]
+        d = np.linalg.norm(np.cross(b - a, p[i] - a)) / (np.linalg.norm(b - a) + 1e-30)
+        if best is None or d < best[0]:
+            best = (d, p[i], a, b)
+    _, B, A, C = best
+    d = C[:2] - A[:2]
+    L = float(np.linalg.norm(d))
+    if L < 1e-12:
+        return None
+    n = np.array([-d[1], d[0]]) / L
+    ring = list(fp.exterior.coords)[:-1]
+    j = int(np.argmin([(pt[0] - B[0]) ** 2 + (pt[1] - B[1]) ** 2 for pt in ring]))
+    if (ring[j][0] - B[0]) ** 2 + (ring[j][1] - B[1]) ** 2 > 1.0:
+        return None  # sliver vertex not found on the ring
+    a0 = fp.area
+    for s in (1.0, -1.0):
+        nb = (ring[j][0] + s * min_edge * n[0], ring[j][1] + s * min_edge * n[1])
+        cand = Polygon(ring[:j] + [nb] + ring[j + 1:])
+        if cand.is_valid and cand.area > 0 and abs(cand.area - a0) < 0.5 * a0:
+            return cand
+    return None
 
 def run_pipeline(input_path, output_path, config):
     t0 = time.time()
@@ -50,7 +153,8 @@ def run_pipeline(input_path, output_path, config):
     else:
         log.info(f"\n[Step 1] Single body — DBSCAN path")
         n_s = min(int(raw.area * config["sampling_density"]), config["max_pts_per_building"] * 100)
-        pts, _ = trimesh.sample.sample_surface(raw, max(n_s, 1000))
+        pts, _ = trimesh.sample.sample_surface(raw, max(n_s, 1000),
+                                                seed=config["random_seed"])
         center = np.mean(pts[:,:2], axis=0)
         pts[:,0] -= center[0]; pts[:,1] -= center[1]
         labels = DBSCAN(eps=config["eps"], min_samples=config["min_pts"]).fit_predict(pts)
@@ -68,6 +172,13 @@ def run_pipeline(input_path, output_path, config):
              f"A_min={config['min_footprint_area']}m2\n")
 
     successful, filt_h, filt_a, failed = [], 0, 0, 0
+    placed_vertices, resolved, sliver_fixes = set(), 0, 0
+
+    def _vkeys(poly):
+        # Quantize to single-precision coordinates: two vertices collapse onto
+        # each other in an STL file exactly when their float32 values match.
+        return {(float(np.float32(x)), float(np.float32(y)))
+                for x, y in poly.exterior.coords}
 
     for i, comp in enumerate(building_meshes):
         try:
@@ -85,7 +196,8 @@ def run_pipeline(input_path, output_path, config):
             if hasattr(comp,'area') and comp.area > 0 and len(comp.faces) > 0:
                 n = min(max(int(comp.area*config["sampling_density"]), config["min_pts_per_building"]),
                         config["max_pts_per_building"])
-                sampled, _ = trimesh.sample.sample_surface(comp, n)
+                sampled, _ = trimesh.sample.sample_surface(comp, n,
+                                                            seed=config["random_seed"])
             else:
                 sampled = verts
 
@@ -99,17 +211,50 @@ def run_pipeline(input_path, output_path, config):
             fp = hull.simplify(config["simplify_tolerance"], preserve_topology=True)
             if fp.is_empty: fp = hull
 
-            m = trimesh.creation.extrude_polygon(fp, height=h)
-            m.apply_translation([0,0,zl]); m.merge_vertices()
-            trimesh.repair.fix_normals(m); trimesh.repair.fix_inversion(m)
+            # v1.1: ring regularization (sub-precision edges, collinear vertices)
+            cleaned = _clean_polygon(fp, config["min_edge_length"])
+            if cleaned is not None:
+                fp = cleaned
 
-            # Remove degenerate faces
-            if len(m.faces) > 0:
-                valid = m.area_faces > 1e-10
-                if not np.all(valid):
-                    m.update_faces(valid); m.remove_unreferenced_vertices()
+            # v1.1: resolve coincident walls with already-placed buildings
+            if _vkeys(fp) & placed_vertices:
+                for attempt in (1, 2):
+                    cand = fp.buffer(-attempt * config["coincident_inset"], join_style=2)
+                    if cand.geom_type != 'Polygon' or cand.is_empty or not cand.is_valid:
+                        break
+                    cand = _clean_polygon(cand, config["min_edge_length"])
+                    if cand is None:
+                        break
+                    fp = cand; resolved += 1
+                    if not (_vkeys(fp) & placed_vertices):
+                        break
 
-            if m.is_watertight: successful.append(m)
+            # v1.1: extrude; if a cap face would degenerate at single-precision
+            # resolution, perturb the responsible footprint vertex and retry
+            m = None
+            for _attempt in range(4):
+                m = trimesh.creation.extrude_polygon(fp, height=h)
+                m.apply_translation([0,0,zl]); m.merge_vertices()
+                trimesh.repair.fix_normals(m); trimesh.repair.fix_inversion(m)
+
+                # Remove degenerate faces
+                if len(m.faces) > 0:
+                    valid = m.area_faces > 1e-10
+                    if not np.all(valid):
+                        m.update_faces(valid); m.remove_unreferenced_vertices()
+
+                if not m.is_watertight:
+                    break
+                if _verify_mesh_integrity(m)[1] == 0:
+                    break
+                fp2 = _fix_sliver(fp, m, config["min_edge_length"])
+                if fp2 is None:
+                    break
+                fp = fp2; sliver_fixes += 1
+
+            placed_vertices |= _vkeys(fp)
+
+            if m is not None and m.is_watertight: successful.append(m)
             else: failed += 1
         except Exception as e:
             failed += 1; log.debug(f"  Building {i+1} failed: {e}")
@@ -122,6 +267,15 @@ def run_pipeline(input_path, output_path, config):
     if not successful: log.error("No valid buildings."); return None
 
     city = trimesh.util.concatenate(successful)
+
+    # v1.1: mesh-level QC at single-precision (export) resolution
+    nm_edges, deg_faces = _verify_mesh_integrity(city)
+    log.info(f"\n[QC] float32 mesh-level check: non-manifold edges={nm_edges}, "
+             f"degenerate faces={deg_faces}, coincident-wall insets={resolved}, "
+             f"sliver-vertex fixes={sliver_fixes}")
+    if nm_edges or deg_faces:
+        log.warning("[QC] residual mesh-level defects detected - inspect output")
+
     city.export(output_path)
     elapsed = time.time() - t0
     log.info(f"\n{'='*60}")

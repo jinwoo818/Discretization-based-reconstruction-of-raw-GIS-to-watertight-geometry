@@ -1,0 +1,9 @@
+# Dependencies of the reconstruction pipeline (pipeline.py) and the
+# measurement script (metrics.py). The manuscript results were produced
+# with the exact versions below; any newer version satisfying the same
+# API is expected to work.
+numpy==2.5.3
+trimesh==5.1.0
+shapely==2.1.2
+scikit-learn==1.9.1
+mapbox-earcut==2.1.0

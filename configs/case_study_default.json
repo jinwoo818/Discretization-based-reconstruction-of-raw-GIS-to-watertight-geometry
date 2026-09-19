@@ -1,0 +1,18 @@
+{
+  "_comment": "Full configuration of the case study. This file mirrors the built-in defaults of pipeline.py and the hyperparameters reported in Table 2 of the manuscript. pipeline.py reads its configuration from CLI options and built-in defaults; this file documents the exact values used for the case-study results.",
+  "sampling_density": 10.0,
+  "max_pts_per_building": 2000,
+  "min_pts_per_building": 100,
+  "eps": 2.5,
+  "min_pts": 30,
+  "alpha_ratio": 0.2,
+  "allow_holes": false,
+  "simplify_tolerance": 0.5,
+  "height_percentile_low": 5,
+  "height_percentile_high": 99,
+  "min_building_height": 2.0,
+  "min_footprint_area": 8.0,
+  "random_seed": 0,
+  "min_edge_length": 0.15,
+  "coincident_inset": 0.15
+}
