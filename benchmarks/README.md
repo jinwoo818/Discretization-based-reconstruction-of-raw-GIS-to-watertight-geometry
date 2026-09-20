@@ -31,7 +31,8 @@ The input point clouds are public and are **not** redistributed here
 python ../pipeline.py data/tud_buildings_pc.laz      --ground data/tud_ground_pc.laz      -o outputs/tud_pc_modeled.stl
 python ../pipeline.py data/stanford_buildings_pc.laz --ground data/stanford_ground_pc.laz -o outputs/stanford_pc_modeled.stl
 
-# mesh input route (secondary; automatically extruded inputs, see paper)
+# mesh input route (secondary; extruded from the distributed footprint
+# polygons with `tud_extrude.py` / `stanford_extrude.py`)
 python ../pipeline.py data/tud_raw_gis_extruded.stl      -o outputs/tud_modeled.stl
 python ../pipeline.py data/stanford_raw_gis_extruded.stl -o outputs/stanford_modeled.stl
 
@@ -65,5 +66,6 @@ the qualifications.
 ## Contents
 
 - `stanford_pc_prep.py` — USGS 3DEP tiles -> building/ground point clouds
+- `tud_extrude.py`, `stanford_extrude.py` — build the extruded mesh-route inputs in `data/`
 - `render_figure.py` — regenerates the Section 4.3 figure
 - `outputs/` — the four pipeline outputs as shipped with the paper
