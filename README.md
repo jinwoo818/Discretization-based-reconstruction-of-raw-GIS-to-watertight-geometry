@@ -28,6 +28,7 @@ footprint area).
 | `metrics.py` | Measurement script for the geometric quality metrics (Section 2.7 / Table 4) |
 | `reproduce_table4.py` | One-command reproduction of Table 4 from the benchmark geometries |
 | `benchmarks/` | Reproduction of the Section 4.3 comparative evaluation (TU Delft / Stanford public datasets) |
+| `figures/render_process_figure.py` | Generates the process illustration figure (Section 2.5): reconstruction stages of a U-shaped building and the effect of the concave-hull ratio and DP tolerance |
 | `configs/case_study_default.json` | Full configuration of the case study (mirrors built-in defaults / Table 2) |
 | `example/input_defective_gis.stl` | Small synthetic defective input (gaps, non-manifold edges, open shells, debris) |
 | `example/expected_output_LOD1.stl` | Expected pipeline output for the example input |
