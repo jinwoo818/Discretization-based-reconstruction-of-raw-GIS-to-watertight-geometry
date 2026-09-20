@@ -8,21 +8,26 @@ Source code and benchmark data for:
 > revised manuscript).
 
 The pipeline reconstructs watertight LOD1 building geometry from heterogeneous
-and defective mesh-based GIS data by (i) decomposing the input into connected
-components, (ii) discarding the input mesh connectivity through surface
-sampling, (iii) clustering the sampled points with DBSCAN, (iv) extracting
-building footprints as concave (alpha-shape) hulls, (v) simplifying the
-footprints with the Douglas–Peucker algorithm, and (vi) extruding and
-regularizing the result into watertight closed manifolds with integrated
-physics-aware filtering (minimum building height and footprint area).
+and defective GIS data. It accepts two input regimes (Section 2.2 of the
+manuscript): **mesh-based** inputs (STL/OBJ/PLY) and **point-cloud** inputs
+(LAS/LAZ/XYZ, e.g. classified airborne LiDAR). In both regimes it (i)
+identifies building candidates (connected-component decomposition for meshes;
+DBSCAN clustering for point clouds), (ii) discards the input connectivity
+through surface sampling (meshes) or uses the clustered points directly
+(point clouds), (iii) extracts building footprints as concave (alpha-shape)
+hulls, (iv) simplifies the footprints with the Douglas–Peucker algorithm,
+and (v) extrudes and regularizes the result into watertight closed manifolds
+with integrated physics-aware filtering (minimum building height and
+footprint area).
 
 ## Repository contents
 
 | File | Description |
 |---|---|
-| `pipeline.py` | Complete reconstruction pipeline (v1.1, the exact version used for the revised manuscript) |
+| `pipeline.py` | Complete reconstruction pipeline (v1.2, the exact version used for the revised manuscript) |
 | `metrics.py` | Measurement script for the geometric quality metrics (Section 2.7 / Table 4) |
 | `reproduce_table4.py` | One-command reproduction of Table 4 from the benchmark geometries |
+| `benchmarks/` | Reproduction of the Section 4.3 comparative evaluation (TU Delft / Stanford public datasets) |
 | `configs/case_study_default.json` | Full configuration of the case study (mirrors built-in defaults / Table 2) |
 | `example/input_defective_gis.stl` | Small synthetic defective input (gaps, non-manifold edges, open shells, debris) |
 | `example/expected_output_LOD1.stl` | Expected pipeline output for the example input |
@@ -65,11 +70,32 @@ correspond one-to-one to the values reported in Table 2 of the manuscript:
 | `--simplify` | 0.5 | ε_dp | Douglas–Peucker simplification tolerance (m) |
 | `--min_height` | 2.0 | H_min | Minimum building height (m) |
 | `--min_fp_area` | 8.0 | A_fp,min | Minimum footprint area (m²) |
+| `--classification` | – | – | LAS class to keep for point-cloud inputs (e.g. 6 = building) |
+| `--ground` | – | – | Ground point cloud for base-elevation estimation of point-cloud inputs |
+| `--ground_buffer` | 5.0 | – | Buffer (m) around the cluster bounding box for the ground-point lookup |
 
 Additional fixed defaults (documented in `configs/case_study_default.json`):
 height percentiles Z_5 / Z_99 for building-height derivation,
 `max_pts_per_building` = 2000, `min_pts_per_building` = 100,
 `allow_holes` = False, `random_seed` = 0.
+
+### Point-cloud input (v1.2)
+
+```bash
+python pipeline.py buildings.laz --classification 6 --ground ground.laz -o output_LOD1.stl
+```
+
+Point-cloud inputs (LAS/LAZ/XYZ) follow the point-cloud identification path
+of Section 2.2: buildings are identified by DBSCAN clustering of the raw
+points, and the clustered point set is used directly for footprint
+extraction (Section 2.3). For classified airborne LiDAR, the building points
+are dominated by roof returns, so the base elevation of each cluster is
+estimated from the accompanying ground points (`--ground`): the median ground
+elevation within the cluster bounding box expanded by `--ground_buffer`,
+with the building height taken as the 99th-percentile roof elevation minus
+this base elevation (Section 2.5). When no ground cloud is provided, the
+percentile definition of Eq. (9) is used directly (appropriate for
+mesh-sampled points, which include the facades).
 
 ### Geometry-consistency safeguards (v1.1)
 
@@ -166,24 +192,40 @@ watertightness rate and the ratio metrics of Table 4 are computed over all
 connected components, including residual fragments. Use `--json out.json`
 to export the full statistics.
 
+## Reproducing the Section 4.3 benchmark
+
+`benchmarks/` reproduces the comparative evaluation on the public TU Delft
+and Stanford campus datasets associated with City4CFD (Pađen et al. 2024),
+including data-download instructions, preparation scripts, the four pipeline
+outputs, and the figure script. See `benchmarks/README.md`.
+
 ## Hardware and timing
 
-The processing time reported in the manuscript (190 s for approximately
-15,000 buildings) was measured on a workstation equipped with an Intel Core
-i7-12700KF CPU (3.61 GHz) and 32 GB of memory. The reported time is the
-total wall-clock time of a single pipeline execution, including input
-loading and output export, measured with the Python `time` module.
+The processing time reported in the manuscript for the case study (190 s for
+approximately 15,000 buildings) was measured on a workstation equipped with
+an Intel Core i7-12700KF CPU (3.61 GHz) and 32 GB of memory. The reported
+time is the total wall-clock time of a single pipeline execution, including
+input loading and output export, measured with the Python `time` module.
+The Section 4.3 benchmark runs were executed on a virtualized server CPU
+(2 vCPUs, 2.9 GHz); see Section 4.3 of the manuscript and
+`benchmarks/README.md` for the reference values and the hardware
+qualifications.
 
 ## Versioning
 
-- **v1.1** (revised manuscript): adds seeded sampling, ring regularization,
-  coincident-wall resolution, and single-precision mesh-level verification,
-  eliminating the residual non-manifold edges and degenerate faces of
-  earlier versions.
+- **v1.2** (revised manuscript): adds the point-cloud input path described
+  in Sections 2.2–2.3 (LAS/LAZ/XYZ input, LAS classification filtering,
+  DBSCAN identification, ground-point base-elevation estimation for airborne
+  LiDAR). The mesh-based route is unchanged from v1.1 and reproduces the
+  case-study output bit-identically (verified by checksum).
+- **v1.1**: adds seeded sampling, ring regularization, coincident-wall
+  resolution, and single-precision mesh-level verification, eliminating the
+  residual non-manifold edges and degenerate faces of earlier versions.
 - **v1.0**: initial release version.
 
-The release tagged `v1.1` corresponds to the revised manuscript. All
-results in the manuscript can be reproduced with this tagged version.
+The release tagged `v1.2` corresponds to the revised manuscript. All
+results in the manuscript can be reproduced with this tagged version (the
+case-study results of the original submission with `v1.1`).
 
 ## Data availability
 

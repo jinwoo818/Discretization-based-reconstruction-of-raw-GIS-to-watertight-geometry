@@ -7,3 +7,4 @@ trimesh==5.1.0
 shapely==2.1.2
 scikit-learn==1.9.1
 mapbox-earcut==2.1.0
+laspy[lazrs]==2.7.0

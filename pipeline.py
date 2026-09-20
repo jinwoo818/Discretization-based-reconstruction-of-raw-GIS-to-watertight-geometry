@@ -9,7 +9,17 @@ Pipeline Steps:
   Step 3. Footprint Extraction via Concave Hull (alpha shape)
   Step 4. Douglas-Peucker Simplification, 2.5D Extrusion & Mesh Repair
 
+Inputs: mesh-based GIS (STL/OBJ/PLY) or point-cloud data (LAS/LAZ/XYZ).
+Point-cloud inputs are identified via DBSCAN (Section 2.2) and used
+  directly, without separate surface sampling (Section 2.3).
+For point-cloud inputs, an optional ground point cloud (--ground)
+  provides the base elevation of each building; this is required for
+  airborne LiDAR, where classified building points are dominated by
+  roof returns and the lower percentile of the cluster corresponds to
+  the eave level rather than the ground.
+
 Dependencies: pip install numpy trimesh shapely scikit-learn mapbox-earcut
+              (point-cloud input additionally requires: pip install laspy[lazrs])
 
 Reference:
   Choi, J., Hong, T., Kim, H., and Jeong, K. (2026). Discretization-based
@@ -44,6 +54,8 @@ DEFAULT_CONFIG = {
     # so that vertices can never collapse onto each other on export.
     "min_edge_length": 0.15,
     "coincident_inset": 0.15,
+    # --- point-cloud input (Section 2.2) ---
+    "ground_buffer": 5.0,
 }
 
 def _clean_polygon(poly, min_edge):
@@ -136,6 +148,64 @@ def _fix_sliver(fp, mesh, min_edge):
             return cand
     return None
 
+def _load_points(input_path, classification=None):
+    """Load a point-cloud input (LAS/LAZ/XYZ/TXT). Returns an (N,3) float64
+    array in metric coordinates, or None if the file is not point-based.
+    If `classification` is given (LAS classification code, e.g. 6 = building),
+    only points of that class are kept — the same preparation City4CFD-style
+    workflows ask the user to provide as separated building points."""
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext in (".las", ".laz"):
+        import laspy
+        las = laspy.read(input_path)
+        pts = np.column_stack([np.asarray(las.x), np.asarray(las.y),
+                               np.asarray(las.z)]).astype(np.float64)
+        if classification is not None:
+            keep = np.asarray(las.classification) == int(classification)
+            pts = pts[keep]
+        return pts
+    if ext in (".xyz", ".txt"):
+        return np.loadtxt(input_path, usecols=(0, 1, 2))
+    return None
+
+def _identify_points(pts, eps, min_pts, grid=1.0):
+    """DBSCAN building identification for point-cloud inputs (Section 2.2).
+    Points are binned into 1 m xy grid cells and DBSCAN is run on the unique
+    cell centers with the per-cell point counts passed as sample_weight, so
+    that the core-point condition keeps the point-count weighting of the
+    MinPts criterion on the input points while reducing redundant LiDAR
+    points for computational efficiency. Returns a list of (N_k,3) point
+    arrays, one per identified building cluster."""
+    keys = np.floor(pts[:, :2] / grid).astype(np.int64)
+    _, inv, counts = np.unique(keys, axis=0, return_inverse=True,
+                                return_counts=True)
+    uniq = np.unique(keys, axis=0)
+    centers = (uniq + 0.5) * grid
+    log.info(f"  {len(pts):,} points -> {len(centers):,} grid cells")
+    labels = DBSCAN(eps=eps, min_samples=min_pts).fit_predict(
+        centers, sample_weight=counts.astype(np.float64))
+    cell_labels = labels[inv]                      # back to raw points
+    noise = int(np.sum(cell_labels == -1))
+    ids = set(cell_labels.tolist()); ids.discard(-1)
+    log.info(f"  {len(ids)} buildings, {noise:,} noise points")
+    return [pts[cell_labels == l] for l in sorted(ids)]
+
+def _ground_elevation(ground, xy, buf, min_pts=10):
+    """Base elevation of a building cluster: median z of ground points
+    within the xy bounding box of the cluster, expanded by `buf` meters
+    (ground_buffer). Returns None when too few ground points are available
+    (the caller then falls back to the lower percentile of the cluster
+    points). `ground` must be pre-sorted by x (see _sort_by_x)."""
+    x0, x1 = xy[:, 0].min() - buf, xy[:, 0].max() + buf
+    lo = np.searchsorted(ground[:, 0], x0, side="left")
+    hi = np.searchsorted(ground[:, 0], x1, side="right")
+    cand = ground[lo:hi]
+    m = (cand[:, 1] >= xy[:, 1].min() - buf) & (cand[:, 1] <= xy[:, 1].max() + buf)
+    return float(np.median(cand[m, 2])) if int(m.sum()) >= min_pts else None
+
+def _sort_by_x(pts):
+    return pts[np.argsort(pts[:, 0], kind="stable")] if len(pts) else pts
+
 def run_pipeline(input_path, output_path, config):
     t0 = time.time()
     log.info("=" * 60)
@@ -143,27 +213,48 @@ def run_pipeline(input_path, output_path, config):
     log.info("=" * 60)
     log.info(f"  Input:  {input_path}\n  Output: {output_path}\n")
 
-    raw = trimesh.load(input_path, force="mesh")
-    log.info(f"[Load] {len(raw.faces):,} faces, {len(raw.vertices):,} verts, wt={raw.is_watertight}")
-
-    components = raw.split(only_watertight=False)
-    if len(components) > 1:
-        log.info(f"\n[Step 1] Connectivity split: {len(components)} components")
-        building_meshes = [c for c in components if len(c.vertices) >= 4]
+    cloud_pts = _load_points(input_path, config.get("classification"))
+    base_elev = None
+    if cloud_pts is not None:
+        log.info(f"[Load] point cloud: {len(cloud_pts):,} points")
+        ground = _load_points(config["ground"]) if config.get("ground") else None
+        if ground is not None:
+            log.info(f"[Load] ground cloud: {len(ground):,} points")
+            ground = _sort_by_x(ground)
+        log.info(f"\n[Step 1] Point-cloud input - DBSCAN identification "
+                 f"(eps={config['eps']}, MinPts={config['min_pts']})")
+        clusters = _identify_points(cloud_pts, config["eps"], config["min_pts"])
+        if ground is not None:
+            base_elev = [_ground_elevation(ground, c[:, :2],
+                                           config["ground_buffer"])
+                         for c in clusters]
+            n_fb = sum(b is None for b in base_elev)
+            if n_fb:
+                log.info(f"  ground-based base elevation unavailable for {n_fb} "
+                         f"clusters (lower-percentile fallback)")
+        building_meshes = [trimesh.Trimesh(vertices=c) for c in clusters]
     else:
-        log.info(f"\n[Step 1] Single body — DBSCAN path")
-        n_s = min(int(raw.area * config["sampling_density"]), config["max_pts_per_building"] * 100)
-        pts, _ = trimesh.sample.sample_surface(raw, max(n_s, 1000),
-                                                seed=config["random_seed"])
-        center = np.mean(pts[:,:2], axis=0)
-        pts[:,0] -= center[0]; pts[:,1] -= center[1]
-        labels = DBSCAN(eps=config["eps"], min_samples=config["min_pts"]).fit_predict(pts)
-        unique = set(labels); unique.discard(-1)
-        log.info(f"  {len(unique)} buildings, {int(np.sum(labels==-1))} noise")
-        building_meshes = []
-        for l in unique:
-            cp = pts[labels==l].copy(); cp[:,0]+=center[0]; cp[:,1]+=center[1]
-            building_meshes.append(trimesh.Trimesh(vertices=cp))
+        raw = trimesh.load(input_path, force="mesh")
+        log.info(f"[Load] {len(raw.faces):,} faces, {len(raw.vertices):,} verts, wt={raw.is_watertight}")
+
+        components = raw.split(only_watertight=False)
+        if len(components) > 1:
+            log.info(f"\n[Step 1] Connectivity split: {len(components)} components")
+            building_meshes = [c for c in components if len(c.vertices) >= 4]
+        else:
+            log.info(f"\n[Step 1] Single body — DBSCAN path")
+            n_s = min(int(raw.area * config["sampling_density"]), config["max_pts_per_building"] * 100)
+            pts, _ = trimesh.sample.sample_surface(raw, max(n_s, 1000),
+                                                    seed=config["random_seed"])
+            center = np.mean(pts[:,:2], axis=0)
+            pts[:,0] -= center[0]; pts[:,1] -= center[1]
+            labels = DBSCAN(eps=config["eps"], min_samples=config["min_pts"]).fit_predict(pts)
+            unique = set(labels); unique.discard(-1)
+            log.info(f"  {len(unique)} buildings, {int(np.sum(labels==-1))} noise")
+            building_meshes = []
+            for l in unique:
+                cp = pts[labels==l].copy(); cp[:,0]+=center[0]; cp[:,1]+=center[1]
+                building_meshes.append(trimesh.Trimesh(vertices=cp))
 
     n_total = len(building_meshes)
     log.info(f"  Candidates: {n_total:,}")
@@ -183,8 +274,12 @@ def run_pipeline(input_path, output_path, config):
     for i, comp in enumerate(building_meshes):
         try:
             verts = np.array(comp.vertices)
-            zl = np.percentile(verts[:,2], config["height_percentile_low"])
             zh = np.percentile(verts[:,2], config["height_percentile_high"])
+            if base_elev is not None and base_elev[i] is not None:
+                # point-cloud input with ground cloud: base from ground points
+                zl = base_elev[i]
+            else:
+                zl = np.percentile(verts[:,2], config["height_percentile_low"])
             h = zh - zl
             if h < config["min_building_height"]: filt_h += 1; continue
 
@@ -199,7 +294,16 @@ def run_pipeline(input_path, output_path, config):
                 sampled, _ = trimesh.sample.sample_surface(comp, n,
                                                             seed=config["random_seed"])
             else:
-                sampled = verts
+                # point-cloud component (Section 2.3): points are used directly;
+                # for hull extraction only, subsample to the same per-building
+                # cap as the mesh path (height percentiles use all points)
+                if len(verts) > config["max_pts_per_building"]:
+                    rng = np.random.default_rng(config["random_seed"] + i)
+                    idx = rng.choice(len(verts), config["max_pts_per_building"],
+                                     replace=False)
+                    sampled = verts[idx]
+                else:
+                    sampled = verts
 
             pts_2d = sampled[:,:2]
             mp = MultiPoint(pts_2d)
@@ -288,8 +392,19 @@ def run_pipeline(input_path, output_path, config):
 def main():
     p = argparse.ArgumentParser(description="Urban CFD LOD1 Pipeline",
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("input", help="Input mesh file (STL/OBJ/PLY)")
+    p.add_argument("input", help="Input mesh (STL/OBJ/PLY) or point cloud (LAS/LAZ/XYZ)")
     p.add_argument("-o","--output", default=None, help="Output STL path")
+    p.add_argument("--classification", type=int, default=None,
+                   help="LAS classification code to keep (e.g. 6 = building); "
+                        "point-cloud inputs only")
+    p.add_argument("--ground", default=None,
+                   help="Ground point cloud (LAS/LAZ/XYZ) for base-elevation "
+                        "estimation of point-cloud inputs (airborne LiDAR, "
+                        "roof-dominated building points)")
+    p.add_argument("--ground_buffer", type=float,
+                   default=DEFAULT_CONFIG["ground_buffer"],
+                   help="Buffer (m) around the cluster bounding box for "
+                        "ground-point base-elevation lookup")
     p.add_argument("--density", type=float, default=DEFAULT_CONFIG["sampling_density"])
     p.add_argument("--eps", type=float, default=DEFAULT_CONFIG["eps"])
     p.add_argument("--min_pts", type=int, default=DEFAULT_CONFIG["min_pts"])
@@ -304,7 +419,9 @@ def main():
     cfg = DEFAULT_CONFIG.copy()
     cfg.update({"sampling_density":a.density,"eps":a.eps,"min_pts":a.min_pts,
                 "alpha_ratio":a.alpha,"simplify_tolerance":a.simplify,
-                "min_building_height":a.min_height,"min_footprint_area":a.min_fp_area})
+                "min_building_height":a.min_height,"min_footprint_area":a.min_fp_area,
+                "classification":a.classification,"ground":a.ground,
+                "ground_buffer":a.ground_buffer})
     out = a.output or os.path.splitext(a.input)[0] + "_LOD1.stl"
     run_pipeline(a.input, out, cfg)
 
